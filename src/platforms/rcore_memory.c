@@ -52,6 +52,16 @@
     #include <fcntl.h>
 #endif
 
+#if defined(__linux__)
+    #include <errno.h>
+    #include <linux/input.h>
+    #include <linux/fb.h>
+    #include <sys/ioctl.h>
+    #include <sys/mman.h>
+    #include <stdio.h>
+    #include <string.h>
+#endif
+
 //----------------------------------------------------------------------------------
 // Types and Structures Definition
 //----------------------------------------------------------------------------------
@@ -64,6 +74,17 @@ __declspec(dllimport) int __stdcall QueryPerformanceFrequency(LARGE_INTEGER *lpF
 
 typedef struct {
     unsigned int *pixels;   // Pointer to pixel data buffer (RGBA8888 format)
+#if defined(__linux__)
+    int fbFd;
+    struct fb_var_screeninfo vinfo;
+    struct fb_fix_screeninfo finfo;
+    unsigned char *fbp;
+    size_t fbSize;
+    int fbBuffers;
+    int fbBufferIndex;
+    int inputFds[8];
+    int inputFdCount;
+#endif
 #if defined(_WIN32)
     LARGE_INTEGER timerFrequency;
 #endif
@@ -353,6 +374,52 @@ void SwapScreenBuffer(void)
 {
     // Update framebuffer
     rlCopyFramebuffer(0, 0, CORE.Window.render.width, CORE.Window.render.height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, platform.pixels);
+
+#if defined(__linux__) && defined(RAYLIB_MMF_FB)
+    if ((platform.fbp != NULL) && (platform.fbSize > 0))
+    {
+        int width = CORE.Window.render.width;
+        int height = CORE.Window.render.height;
+        int bpp = platform.vinfo.bits_per_pixel;
+        int bytesPerPixel = bpp/8;
+
+        int bufferIndex = platform.fbBufferIndex;
+        int yoff = bufferIndex * height;
+
+        for (int y = 0; y < height; y++)
+        {
+            unsigned char *row = platform.fbp + (yoff + y) * platform.finfo.line_length;
+            unsigned int *src = platform.pixels + (height - 1 - y) * width;
+
+            for (int x = 0; x < width; x++)
+            {
+                unsigned int px = src[width - 1 - x];
+                // rlsw has SW_FRAMEBUFFER_OUTPUT_BGRA=true (the default): byte layout is [B,G,R,A]
+                unsigned char b = (unsigned char)(px & 0xFF);
+                unsigned char g = (unsigned char)((px >> 8) & 0xFF);
+                unsigned char r = (unsigned char)((px >> 16) & 0xFF);
+
+                unsigned int packed = 0;
+                packed |= (r >> (8 - platform.vinfo.red.length)) << platform.vinfo.red.offset;
+                packed |= (g >> (8 - platform.vinfo.green.length)) << platform.vinfo.green.offset;
+                packed |= (b >> (8 - platform.vinfo.blue.length)) << platform.vinfo.blue.offset;
+
+                memcpy(row + x * bytesPerPixel, &packed, bytesPerPixel);
+            }
+        }
+
+        // Pan to the drawn buffer
+        if (platform.fbBuffers > 1)
+        {
+            platform.vinfo.yoffset = yoff;
+            if (ioctl(platform.fbFd, FBIOPAN_DISPLAY, &platform.vinfo) < 0)
+            {
+                // Ignore pan errors; still better than nothing
+            }
+            platform.fbBufferIndex = (platform.fbBufferIndex + 1) % platform.fbBuffers;
+        }
+    }
+#endif
 }
 
 //----------------------------------------------------------------------------------
@@ -470,6 +537,33 @@ void PollInputEvents(void)
 
     // TODO: Poll input events for current platform
 
+#if defined(__linux__)
+    for (int i = 0; i < platform.inputFdCount; i++)
+    {
+        struct input_event ev;
+        while (read(platform.inputFds[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev))
+        {
+            if (ev.type == EV_KEY && ev.value == 1)
+            {
+                switch (ev.code)
+                {
+                    case KEY_ESC:
+                    case KEY_Q:
+                    case KEY_BACKSPACE:
+                    case KEY_ENTER:
+                    case KEY_POWER:
+                    case KEY_MENU:
+                    case KEY_HOME:
+                        CORE.Window.shouldClose = true;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+    }
+#endif
+
     // Check for key pressed to exit
     if (kbhit())
     {
@@ -497,6 +591,53 @@ int InitPlatform(void)
         // Load memory framebuffer with desired screen size
         platform.pixels = (unsigned int *)RL_CALLOC(CORE.Window.screen.width*CORE.Window.screen.height, sizeof(int));
     }
+
+#if defined(__linux__) && defined(RAYLIB_MMF_FB)
+    platform.fbFd = open("/dev/fb0", O_RDWR);
+    if (platform.fbFd >= 0)
+    {
+        if (ioctl(platform.fbFd, FBIOGET_VSCREENINFO, &platform.vinfo) == 0 &&
+            ioctl(platform.fbFd, FBIOGET_FSCREENINFO, &platform.finfo) == 0)
+        {
+            platform.fbSize = (size_t)platform.finfo.line_length * platform.vinfo.yres_virtual;
+            platform.fbp = (unsigned char *)mmap(0, platform.fbSize, PROT_READ | PROT_WRITE, MAP_SHARED, platform.fbFd, 0);
+            if (platform.fbp == MAP_FAILED) platform.fbp = NULL;
+
+            // Override screen size to match framebuffer
+            CORE.Window.display.width = platform.vinfo.xres;
+            CORE.Window.display.height = platform.vinfo.yres;
+            CORE.Window.screen.width = platform.vinfo.xres;
+            CORE.Window.screen.height = platform.vinfo.yres;
+
+            CORE.Window.render.width = CORE.Window.screen.width;
+            CORE.Window.render.height = CORE.Window.screen.height;
+            CORE.Window.currentFbo.width = CORE.Window.render.width;
+            CORE.Window.currentFbo.height = CORE.Window.render.height;
+
+            // Recreate software framebuffer to match fb size
+            RL_FREE(platform.pixels);
+            platform.pixels = (unsigned int *)RL_CALLOC(CORE.Window.screen.width*CORE.Window.screen.height, sizeof(int));
+
+            platform.fbBuffers = (platform.vinfo.yres > 0) ? (platform.vinfo.yres_virtual / platform.vinfo.yres) : 1;
+            if (platform.fbBuffers < 1) platform.fbBuffers = 1;
+            platform.fbBufferIndex = 0;
+        }
+    }
+#endif
+
+#if defined(__linux__)
+    platform.inputFdCount = 0;
+    for (int i = 0; i < 8; i++)
+    {
+        char path[32] = { 0 };
+        snprintf(path, sizeof(path), "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd >= 0)
+        {
+            platform.inputFds[platform.inputFdCount++] = fd;
+        }
+    }
+#endif
     //----------------------------------------------------------------------------
 
     // If everything worked as expected, continue
@@ -551,6 +692,16 @@ int InitPlatform(void)
 // Close platform
 void ClosePlatform(void)
 {
+#if defined(__linux__) && defined(RAYLIB_MMF_FB)
+    if (platform.fbp != NULL) munmap(platform.fbp, platform.fbSize);
+    if (platform.fbFd >= 0) close(platform.fbFd);
+#endif
+#if defined(__linux__)
+    for (int i = 0; i < platform.inputFdCount; i++)
+    {
+        if (platform.inputFds[i] >= 0) close(platform.inputFds[i]);
+    }
+#endif
     RL_FREE(platform.pixels);
 }
 
