@@ -771,21 +771,62 @@ void PollInputEvents(void)
         struct input_event ev;
         while (read(platform.inputFds[i], &ev, sizeof(ev)) == (ssize_t)sizeof(ev))
         {
-            if (ev.type == EV_KEY && ev.value == 1)
+            if (ev.type == EV_KEY)
             {
+                // Translate Linux evdev keycode → raylib key constant.
+                // MMF button mapping (verified via evdev probe):
+                //   D-Pad: 103=UP 108=DOWN 105=LEFT 106=RIGHT
+                //   A=57(SPACE) B=29(LCTRL) X=42(LSHIFT) Y=56(LALT)
+                //   L1=18(E) L2=15(TAB) R1=20(T) R2=14(BACKSPACE)
+                //   Start=28(ENTER) Select=97(RCTRL) Menu=1(ESC) Power=116
+                int raylibKey = 0;
                 switch (ev.code)
                 {
-                    case KEY_ESC:
-                    case KEY_Q:
-                    case KEY_BACKSPACE:
-                    case KEY_ENTER:
-                    case KEY_POWER:
-                    case KEY_MENU:
-                    case KEY_HOME:
-                        CORE.Window.shouldClose = true;
-                        break;
-                    default:
-                        break;
+                    case 103: raylibKey = 265; break; // KEY_UP
+                    case 108: raylibKey = 264; break; // KEY_DOWN
+                    case 105: raylibKey = 263; break; // KEY_LEFT
+                    case 106: raylibKey = 262; break; // KEY_RIGHT
+                    case 57:  raylibKey = 32;  break; // KEY_SPACE (A)
+                    case 29:  raylibKey = 341; break; // KEY_LEFT_CONTROL (B)
+                    case 42:  raylibKey = 340; break; // KEY_LEFT_SHIFT (X)
+                    case 56:  raylibKey = 342; break; // KEY_LEFT_ALT (Y)
+                    case 18:  raylibKey = 69;  break; // KEY_E (L1)
+                    case 15:  raylibKey = 258; break; // KEY_TAB (L2)
+                    case 20:  raylibKey = 84;  break; // KEY_T (R1)
+                    case 14:  raylibKey = 259; break; // KEY_BACKSPACE (R2)
+                    case 28:  raylibKey = 257; break; // KEY_ENTER (Start)
+                    case 97:  raylibKey = 345; break; // KEY_RIGHT_CONTROL (Select)
+                    case 1:   raylibKey = 256; break; // KEY_ESCAPE (Menu)
+                    default: break;
+                }
+
+                if (raylibKey > 0 && raylibKey < MAX_KEYBOARD_KEYS)
+                {
+                    if (ev.value == 1)       // Press
+                    {
+                        CORE.Input.Keyboard.currentKeyState[raylibKey] = 1;
+
+                        // Enqueue for GetKeyPressed()
+                        if (CORE.Input.Keyboard.keyPressedQueueCount < MAX_KEY_PRESSED_QUEUE)
+                        {
+                            CORE.Input.Keyboard.keyPressedQueue[CORE.Input.Keyboard.keyPressedQueueCount] = raylibKey;
+                            CORE.Input.Keyboard.keyPressedQueueCount++;
+                        }
+                    }
+                    else if (ev.value == 0)  // Release
+                    {
+                        CORE.Input.Keyboard.currentKeyState[raylibKey] = 0;
+                    }
+                    else if (ev.value == 2)  // Repeat
+                    {
+                        CORE.Input.Keyboard.keyRepeatInFrame[raylibKey] = 1;
+                    }
+                }
+
+                // Menu or Power → close window
+                if (ev.value == 1 && (ev.code == 1 || ev.code == 116))
+                {
+                    CORE.Window.shouldClose = true;
                 }
             }
         }
