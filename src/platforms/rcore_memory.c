@@ -64,6 +64,10 @@
     #include <dlfcn.h>
 #endif
 
+#if defined(RAYLIB_USE_TINYGL)
+    #include "zbuffer.h"    // TinyGL ZBuffer for direct framebuffer access
+#endif
+
 //----------------------------------------------------------------------------------
 // Types and Structures Definition
 //----------------------------------------------------------------------------------
@@ -75,7 +79,10 @@ __declspec(dllimport) int __stdcall QueryPerformanceFrequency(LARGE_INTEGER *lpF
 #endif
 
 typedef struct {
-    unsigned int *pixels;   // Pointer to pixel data buffer (RGBA8888 format)
+    unsigned int *pixels;   // Pointer to pixel data buffer (RGBA8888 or ARGB8888 format)
+#if defined(RAYLIB_USE_TINYGL)
+    ZBuffer *tglZBuffer;    // TinyGL framebuffer; pixels rendered here in ARGB8888
+#endif
 #if defined(__linux__)
     int fbFd;
     struct fb_var_screeninfo vinfo;
@@ -526,8 +533,7 @@ void DisableCursor(void)
 // Swap back buffer with front buffer (screen drawing)
 void SwapScreenBuffer(void)
 {
-    // rlsw renders into its internal buffer; copy it into platform.pixels (MMA or heap)
-    rlCopyFramebuffer(0, 0, CORE.Window.render.width, CORE.Window.render.height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, platform.pixels);
+    // TinyGL renders directly into platform.pixels via the ZBuffer — no readback needed
 
 #if defined(__linux__) && defined(RAYLIB_MMF_FB)
     if (platform.mi.enabled)
@@ -552,8 +558,8 @@ void SwapScreenBuffer(void)
         dstRect.u32Height = (MI_U32)platform.vinfo.yres;
 
         src.phyAddr = platform.mi.srcPhy;
-        // rlsw with SW_FRAMEBUFFER_OUTPUT_BGRA=true outputs [B,G,R,A] bytes = ARGB8888.
-        // Same layout as the framebuffer — no channel swap needed.
+        // TinyGL stores pixels as ARGB8888 (matching the framebuffer's channel layout).
+        // No channel swap needed; MI GFX passes it through as-is.
         src.eColorFmt = E_MI_GFX_FMT_ARGB8888;
         src.u32Width = (MI_U32)platform.mi.renderWidth;
         src.u32Height = (MI_U32)platform.mi.renderHeight;
@@ -609,10 +615,17 @@ void SwapScreenBuffer(void)
             for (int x = 0; x < width; x++)
             {
                 unsigned int px = src[width - 1 - x];
+#if defined(RAYLIB_USE_TINYGL)
+                // TinyGL pixel format: ARGB8888 (B in low byte, R in byte 2)
+                unsigned char r = (unsigned char)((px >> 16) & 0xFF);
+                unsigned char g = (unsigned char)((px >> 8) & 0xFF);
+                unsigned char b = (unsigned char)(px & 0xFF);
+#else
                 // rlsw has SW_FRAMEBUFFER_OUTPUT_BGRA=true (the default): byte layout is [B,G,R,A]
                 unsigned char b = (unsigned char)(px & 0xFF);
                 unsigned char g = (unsigned char)((px >> 8) & 0xFF);
                 unsigned char r = (unsigned char)((px >> 16) & 0xFF);
+#endif
 
                 unsigned int packed = 0;
                 packed |= (r >> (8 - platform.vinfo.red.length)) << platform.vinfo.red.offset;
@@ -794,10 +807,11 @@ void PollInputEvents(void)
 // Initialize platform: graphics, inputs and more
 int InitPlatform(void)
 {
-    // Memory framebuffer can only work with software renderer
-    if (rlGetVersion() != RL_OPENGL_SOFTWARE)
+    // Memory framebuffer works with rlsw (GRAPHICS_API_OPENGL_SOFTWARE) and TinyGL (GRAPHICS_API_OPENGL_11)
+    int glVer = rlGetVersion();
+    if (glVer != RL_OPENGL_SOFTWARE && glVer != RL_OPENGL_11)
     {
-        TRACELOG(LOG_WARNING, "DISPLAY: Memory platform requires software renderer (GRAPHICS_API_OPENGL_SOFTWARE)");
+        TRACELOG(LOG_WARNING, "DISPLAY: Memory platform requires software renderer (GRAPHICS_API_OPENGL_SOFTWARE or GRAPHICS_API_OPENGL_11)");
         TRACELOG(LOG_FATAL, "PLATFORM: Failed to initialize graphics device");
         return -1;
     }
@@ -835,16 +849,29 @@ int InitPlatform(void)
         }
     }
 
+    int scale = MMF_GetEnvInt("RAYLIB_MMF_SCALE", 1);
+    if (scale < 1) scale = 1;
     platform.renderWidth = CORE.Window.screen.width;
     platform.renderHeight = CORE.Window.screen.height;
 
     if (MMF_GetEnvBool("RAYLIB_MMF_MIGFX", true))
     {
-        if (MMF_InitMiGfx(platform.renderWidth, platform.renderHeight))
+        int scaledWidth = CORE.Window.screen.width / scale;
+        int scaledHeight = CORE.Window.screen.height / scale;
+        if (scaledWidth < 1) scaledWidth = 1;
+        if (scaledHeight < 1) scaledHeight = 1;
+
+#if defined(RAYLIB_USE_TINYGL)
+        // TinyGL requires width to be a multiple of 4
+        scaledWidth = scaledWidth & ~3;
+#endif
+
+        if (MMF_InitMiGfx(scaledWidth, scaledHeight))
         {
-            // Use MMA-allocated buffer so MI GFX can DMA it directly
+            platform.renderWidth = scaledWidth;
+            platform.renderHeight = scaledHeight;
             platform.pixels = (unsigned int *)platform.mi.srcVir;
-            TRACELOG(LOG_INFO, "MMF: Using MI_GFX hardware blit (%dx%d -> %dx%d) [rlsw source]",
+            TRACELOG(LOG_INFO, "MMF: Using MI_GFX hardware blit (%dx%d -> %dx%d)",
                 platform.renderWidth, platform.renderHeight,
                 (int)platform.vinfo.xres, (int)platform.vinfo.yres);
         }
@@ -859,9 +886,24 @@ int InitPlatform(void)
         platform.pixels = (unsigned int *)RL_CALLOC(
             (size_t)platform.renderWidth * (size_t)platform.renderHeight, sizeof(int));
     }
+
+#if defined(RAYLIB_USE_TINYGL)
+    // Initialize TinyGL with the pixel buffer (zero-copy: TinyGL renders directly into platform.pixels)
+    platform.tglZBuffer = ZB_open(platform.renderWidth, platform.renderHeight, ZB_MODE_RGBA, platform.pixels);
+    if (platform.tglZBuffer == NULL)
+    {
+        TRACELOG(LOG_FATAL, "TINYGL: Failed to open ZBuffer");
+        return -1;
+    }
+    glInit(platform.tglZBuffer);
+    TRACELOG(LOG_INFO, "TINYGL: Initialized (%dx%d)", platform.renderWidth, platform.renderHeight);
+#endif
 #else
     platform.renderWidth = CORE.Window.screen.width;
     platform.renderHeight = CORE.Window.screen.height;
+#if defined(RAYLIB_USE_TINYGL)
+    platform.renderWidth = platform.renderWidth & ~3;
+#endif
     platform.pixels = (unsigned int *)RL_CALLOC(
         (size_t)platform.renderWidth * (size_t)platform.renderHeight, sizeof(int));
 #endif
@@ -940,6 +982,11 @@ int InitPlatform(void)
 // Close platform
 void ClosePlatform(void)
 {
+#if defined(RAYLIB_USE_TINYGL)
+    glClose();
+    ZB_close(platform.tglZBuffer);
+    platform.tglZBuffer = NULL;
+#endif
 #if defined(__linux__) && defined(RAYLIB_MMF_FB)
     if (platform.mi.enabled)
     {
