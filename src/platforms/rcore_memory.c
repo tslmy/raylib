@@ -53,13 +53,15 @@
 #endif
 
 #if defined(__linux__)
-    #include <errno.h>
     #include <linux/input.h>
     #include <linux/fb.h>
     #include <sys/ioctl.h>
     #include <sys/mman.h>
     #include <stdio.h>
     #include <string.h>
+    #include <stdlib.h>
+    #include <stdint.h>
+    #include <dlfcn.h>
 #endif
 
 //----------------------------------------------------------------------------------
@@ -82,11 +84,40 @@ typedef struct {
     size_t fbSize;
     int fbBuffers;
     int fbBufferIndex;
+    int renderWidth;
+    int renderHeight;
     int inputFds[8];
     int inputFdCount;
 #endif
 #if defined(_WIN32)
     LARGE_INTEGER timerFrequency;
+#endif
+#if defined(__linux__) && defined(RAYLIB_MMF_FB)
+    struct
+    {
+        bool enabled;
+        void *libGfx;
+        void *libSys;
+        int renderWidth;
+        int renderHeight;
+        uint64_t fbPhy;
+        void *fbVir;
+        uint64_t srcPhy;
+        void *srcVir;
+        size_t srcSize;
+        int (*MI_SYS_Init)(void);
+        int (*MI_SYS_Exit)(void);
+        int (*MI_SYS_MMA_Alloc)(unsigned char *heapName, unsigned int size, uint64_t *phyAddr);
+        int (*MI_SYS_MMA_Free)(uint64_t phyAddr);
+        int (*MI_SYS_Mmap)(uint64_t phyAddr, unsigned int size, void **virtAddr, unsigned char cache);
+        int (*MI_SYS_Munmap)(void *virtAddr, unsigned int size);
+        int (*MI_SYS_FlushInvCache)(void *virtAddr, unsigned int size);
+        int (*MI_SYS_MemsetPa)(uint64_t phyAddr, unsigned int value, unsigned int length);
+        int (*MI_GFX_Open)(void);
+        int (*MI_GFX_Close)(void);
+        int (*MI_GFX_BitBlit)(void *src, void *srcRect, void *dst, void *dstRect, void *opt, unsigned short *fence);
+        int (*MI_GFX_WaitAllDone)(unsigned char waitAllDone, unsigned short fence);
+    } mi;
 #endif
 } PlatformData;
 
@@ -102,6 +133,129 @@ static PlatformData platform = { 0 };   // Platform specific data
 //----------------------------------------------------------------------------------
 int InitPlatform(void);                 // Initialize platform (graphics, inputs and more)
 bool InitGraphicsDevice(void);          // Initialize graphics device
+
+#if defined(__linux__) && defined(RAYLIB_MMF_FB)
+typedef unsigned char MI_BOOL;
+typedef unsigned char MI_U8;
+typedef unsigned short MI_U16;
+typedef unsigned int MI_U32;
+typedef unsigned long long MI_U64;
+typedef signed int MI_S32;
+typedef unsigned long long MI_PHY;
+
+typedef enum
+{
+    E_MI_GFX_FMT_I1 = 0,
+    E_MI_GFX_FMT_I2 = 1,
+    E_MI_GFX_FMT_I4 = 2,
+    E_MI_GFX_FMT_I8 = 3,
+    E_MI_GFX_FMT_FABAFGBG2266 = 4,
+    E_MI_GFX_FMT_1ABFGBG12355 = 5,
+    E_MI_GFX_FMT_RGB565 = 6,
+    E_MI_GFX_FMT_ARGB1555 = 7,
+    E_MI_GFX_FMT_ARGB4444 = 8,
+    E_MI_GFX_FMT_ARGB1555_DST = 9,
+    E_MI_GFX_FMT_YUV422 = 10,
+    E_MI_GFX_FMT_ARGB8888 = 11,
+    E_MI_GFX_FMT_RGBA5551 = 12,
+    E_MI_GFX_FMT_RGBA4444 = 13,
+    E_MI_GFX_FMT_ABGR8888 = 14,
+    E_MI_GFX_FMT_BGRA5551 = 15,
+    E_MI_GFX_FMT_ABGR1555 = 16,
+    E_MI_GFX_FMT_ABGR4444 = 17,
+    E_MI_GFX_FMT_BGRA4444 = 18,
+    E_MI_GFX_FMT_BGR565 = 19,
+    E_MI_GFX_FMT_RGBA8888 = 20,
+    E_MI_GFX_FMT_BGRA8888 = 21
+} MI_GFX_ColorFmt_e;
+
+typedef enum
+{
+    E_MI_GFX_RGB_OP_EQUAL = 0,
+    E_MI_GFX_RGB_OP_NOT_EQUAL,
+    E_MI_GFX_ALPHA_OP_EQUAL,
+    E_MI_GFX_ALPHA_OP_NOT_EQUAL,
+    E_MI_GFX_ARGB_OP_EQUAL,
+    E_MI_GFX_ARGB_OP_NOT_EQUAL
+} MI_GFX_ColorKeyOp_e;
+
+typedef enum
+{
+    E_MI_GFX_DFB_BLD_ZERO = 0,
+    E_MI_GFX_DFB_BLD_ONE = 1
+} MI_GFX_DfbBldOp_e;
+
+typedef enum
+{
+    E_MI_GFX_MIRROR_NONE = 0,
+    E_MI_GFX_MIRROR_HORIZONTAL = 1,
+    E_MI_GFX_MIRROR_VERTICAL = 2,
+    E_MI_GFX_MIRROR_BOTH = 3
+} MI_GFX_Mirror_e;
+
+typedef enum
+{
+    E_MI_GFX_ROTATE_0 = 0,
+    E_MI_GFX_ROTATE_90 = 1,
+    E_MI_GFX_ROTATE_180 = 2,
+    E_MI_GFX_ROTATE_270 = 3
+} MI_GFX_Rotate_e;
+
+typedef enum
+{
+    E_MI_GFX_DFB_BLEND_NOFX = 0x00000000
+} MI_Gfx_DfbBlendFlags_e;
+
+typedef struct
+{
+    MI_S32 s32Xpos;
+    MI_S32 s32Ypos;
+    MI_U32 u32Width;
+    MI_U32 u32Height;
+} MI_GFX_Rect_t;
+
+typedef struct
+{
+    MI_U32 u32ColorStart;
+    MI_U32 u32ColorEnd;
+} MI_GFX_ColorKeyValue_t;
+
+typedef struct
+{
+    MI_BOOL bEnColorKey;
+    MI_GFX_ColorKeyOp_e eCKeyOp;
+    MI_GFX_ColorFmt_e eCKeyFmt;
+    MI_GFX_ColorKeyValue_t stCKeyVal;
+} MI_GFX_ColorKeyInfo_t;
+
+typedef struct
+{
+    MI_PHY phyAddr;
+    MI_GFX_ColorFmt_e eColorFmt;
+    MI_U32 u32Width;
+    MI_U32 u32Height;
+    MI_U32 u32Stride;
+} MI_GFX_Surface_t;
+
+typedef struct
+{
+    MI_GFX_Rect_t stClipRect;
+    MI_GFX_ColorKeyInfo_t stSrcColorKeyInfo;
+    MI_GFX_ColorKeyInfo_t stDstColorKeyInfo;
+    MI_GFX_DfbBldOp_e eSrcDfbBldOp;
+    MI_GFX_DfbBldOp_e eDstDfbBldOp;
+    MI_GFX_Mirror_e eMirror;
+    MI_GFX_Rotate_e eRotate;
+    MI_Gfx_DfbBlendFlags_e eDFBBlendFlag;
+    MI_U32 u32GlobalSrcConstColor;
+    MI_U32 u32GlobalDstConstColor;
+} MI_GFX_Opt_t;
+
+static int MMF_GetEnvInt(const char *name, int defaultValue);
+static bool MMF_GetEnvBool(const char *name, bool defaultValue);
+static bool MMF_InitMiGfx(int renderWidth, int renderHeight);
+static void MMF_ShutdownMiGfx(void);
+#endif
 
 //----------------------------------------------------------------------------------
 // Module Functions Declaration
@@ -372,10 +526,71 @@ void DisableCursor(void)
 // Swap back buffer with front buffer (screen drawing)
 void SwapScreenBuffer(void)
 {
-    // Update framebuffer
+    // rlsw renders into its internal buffer; copy it into platform.pixels (MMA or heap)
     rlCopyFramebuffer(0, 0, CORE.Window.render.width, CORE.Window.render.height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, platform.pixels);
 
 #if defined(__linux__) && defined(RAYLIB_MMF_FB)
+    if (platform.mi.enabled)
+    {
+        MI_GFX_Surface_t src = { 0 };
+        MI_GFX_Surface_t dst = { 0 };
+        MI_GFX_Rect_t srcRect = { 0 };
+        MI_GFX_Rect_t dstRect = { 0 };
+        MI_GFX_Opt_t opt;
+        unsigned short fence = 0;
+
+        memset(&opt, 0, sizeof(opt));
+
+        srcRect.s32Xpos = 0;
+        srcRect.s32Ypos = 0;
+        srcRect.u32Width = (MI_U32)platform.mi.renderWidth;
+        srcRect.u32Height = (MI_U32)platform.mi.renderHeight;
+
+        dstRect.s32Xpos = 0;
+        dstRect.s32Ypos = 0;
+        dstRect.u32Width = (MI_U32)platform.vinfo.xres;
+        dstRect.u32Height = (MI_U32)platform.vinfo.yres;
+
+        src.phyAddr = platform.mi.srcPhy;
+        // rlsw with SW_FRAMEBUFFER_OUTPUT_BGRA=true outputs [B,G,R,A] bytes = ARGB8888.
+        // Same layout as the framebuffer — no channel swap needed.
+        src.eColorFmt = E_MI_GFX_FMT_ARGB8888;
+        src.u32Width = (MI_U32)platform.mi.renderWidth;
+        src.u32Height = (MI_U32)platform.mi.renderHeight;
+        src.u32Stride = (MI_U32)(platform.mi.renderWidth * 4);
+
+        int bufferIndex = platform.fbBufferIndex;
+        int yoff = bufferIndex * platform.vinfo.yres;
+        uint64_t dstPhy = platform.mi.fbPhy + (uint64_t)platform.finfo.line_length * (uint64_t)yoff;
+
+        dst.phyAddr = dstPhy;
+        dst.eColorFmt = E_MI_GFX_FMT_ARGB8888;
+        dst.u32Width = (MI_U32)platform.vinfo.xres;
+        dst.u32Height = (MI_U32)platform.vinfo.yres;
+        dst.u32Stride = (MI_U32)platform.finfo.line_length;
+
+        opt.eSrcDfbBldOp = E_MI_GFX_DFB_BLD_ONE;
+        opt.eDstDfbBldOp = E_MI_GFX_DFB_BLD_ZERO;
+        opt.eDFBBlendFlag = E_MI_GFX_DFB_BLEND_NOFX;
+        opt.eMirror = E_MI_GFX_MIRROR_NONE;
+        opt.eRotate = E_MI_GFX_ROTATE_180;
+
+        platform.mi.MI_SYS_FlushInvCache(platform.mi.srcVir, (unsigned int)platform.mi.srcSize);
+        platform.mi.MI_GFX_BitBlit(&src, &srcRect, &dst, &dstRect, &opt, &fence);
+        platform.mi.MI_GFX_WaitAllDone(1, fence);
+
+        if (platform.fbBuffers > 1)
+        {
+            platform.vinfo.yoffset = yoff;
+            if (ioctl(platform.fbFd, FBIOPAN_DISPLAY, &platform.vinfo) < 0)
+            {
+                // Ignore pan errors; still better than nothing
+            }
+            platform.fbBufferIndex = (platform.fbBufferIndex + 1) % platform.fbBuffers;
+        }
+        return;
+    }
+
     if ((platform.fbp != NULL) && (platform.fbSize > 0))
     {
         int width = CORE.Window.render.width;
@@ -588,8 +803,8 @@ int InitPlatform(void)
     }
     else
     {
-        // Load memory framebuffer with desired screen size
-        platform.pixels = (unsigned int *)RL_CALLOC(CORE.Window.screen.width*CORE.Window.screen.height, sizeof(int));
+        // Framebuffer will be set up below (MMA or heap)
+        platform.pixels = NULL;
     }
 
 #if defined(__linux__) && defined(RAYLIB_MMF_FB)
@@ -614,15 +829,41 @@ int InitPlatform(void)
             CORE.Window.currentFbo.width = CORE.Window.render.width;
             CORE.Window.currentFbo.height = CORE.Window.render.height;
 
-            // Recreate software framebuffer to match fb size
-            RL_FREE(platform.pixels);
-            platform.pixels = (unsigned int *)RL_CALLOC(CORE.Window.screen.width*CORE.Window.screen.height, sizeof(int));
-
             platform.fbBuffers = (platform.vinfo.yres > 0) ? (platform.vinfo.yres_virtual / platform.vinfo.yres) : 1;
             if (platform.fbBuffers < 1) platform.fbBuffers = 1;
             platform.fbBufferIndex = 0;
         }
     }
+
+    platform.renderWidth = CORE.Window.screen.width;
+    platform.renderHeight = CORE.Window.screen.height;
+
+    if (MMF_GetEnvBool("RAYLIB_MMF_MIGFX", true))
+    {
+        if (MMF_InitMiGfx(platform.renderWidth, platform.renderHeight))
+        {
+            // Use MMA-allocated buffer so MI GFX can DMA it directly
+            platform.pixels = (unsigned int *)platform.mi.srcVir;
+            TRACELOG(LOG_INFO, "MMF: Using MI_GFX hardware blit (%dx%d -> %dx%d) [rlsw source]",
+                platform.renderWidth, platform.renderHeight,
+                (int)platform.vinfo.xres, (int)platform.vinfo.yres);
+        }
+        else
+        {
+            TRACELOG(LOG_WARNING, "MMF: MI_GFX unavailable, falling back to CPU blit");
+        }
+    }
+
+    if (platform.pixels == NULL)
+    {
+        platform.pixels = (unsigned int *)RL_CALLOC(
+            (size_t)platform.renderWidth * (size_t)platform.renderHeight, sizeof(int));
+    }
+#else
+    platform.renderWidth = CORE.Window.screen.width;
+    platform.renderHeight = CORE.Window.screen.height;
+    platform.pixels = (unsigned int *)RL_CALLOC(
+        (size_t)platform.renderWidth * (size_t)platform.renderHeight, sizeof(int));
 #endif
 
 #if defined(__linux__)
@@ -641,10 +882,17 @@ int InitPlatform(void)
     //----------------------------------------------------------------------------
 
     // If everything worked as expected, continue
+#if defined(__linux__)
+    CORE.Window.render.width = platform.renderWidth;
+    CORE.Window.render.height = platform.renderHeight;
+    CORE.Window.currentFbo.width = platform.renderWidth;
+    CORE.Window.currentFbo.height = platform.renderHeight;
+#else
     CORE.Window.render.width = CORE.Window.screen.width;
     CORE.Window.render.height = CORE.Window.screen.height;
     CORE.Window.currentFbo.width = CORE.Window.render.width;
     CORE.Window.currentFbo.height = CORE.Window.render.height;
+#endif
 
     TRACELOG(LOG_INFO, "DISPLAY: Device initialized successfully");
     TRACELOG(LOG_INFO, "    > Display size: %i x %i", CORE.Window.display.width, CORE.Window.display.height);
@@ -693,6 +941,11 @@ int InitPlatform(void)
 void ClosePlatform(void)
 {
 #if defined(__linux__) && defined(RAYLIB_MMF_FB)
+    if (platform.mi.enabled)
+    {
+        MMF_ShutdownMiGfx();
+        platform.pixels = NULL;
+    }
     if (platform.fbp != NULL) munmap(platform.fbp, platform.fbSize);
     if (platform.fbFd >= 0) close(platform.fbFd);
 #endif
@@ -702,12 +955,105 @@ void ClosePlatform(void)
         if (platform.inputFds[i] >= 0) close(platform.inputFds[i]);
     }
 #endif
-    RL_FREE(platform.pixels);
+    if (platform.pixels != NULL) RL_FREE(platform.pixels);
 }
 
 //----------------------------------------------------------------------------------
 // Module Internal Functions Definition
 //----------------------------------------------------------------------------------
+
+#if defined(__linux__) && defined(RAYLIB_MMF_FB)
+static int MMF_GetEnvInt(const char *name, int defaultValue)
+{
+    const char *value = getenv(name);
+    if ((value == NULL) || (value[0] == '\0')) return defaultValue;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value) return defaultValue;
+    return (int)parsed;
+}
+
+static bool MMF_GetEnvBool(const char *name, bool defaultValue)
+{
+    const char *value = getenv(name);
+    if ((value == NULL) || (value[0] == '\0')) return defaultValue;
+    return (value[0] != '0');
+}
+
+static bool MMF_InitMiGfx(int renderWidth, int renderHeight)
+{
+    if (platform.mi.enabled) return true;
+
+    platform.mi.libSys = dlopen("libmi_sys.so", RTLD_NOW | RTLD_GLOBAL);
+    platform.mi.libGfx = dlopen("libmi_gfx.so", RTLD_NOW | RTLD_GLOBAL);
+    if ((platform.mi.libSys == NULL) || (platform.mi.libGfx == NULL)) goto error;
+
+    #define MMF_LOAD_SYM(handle, field, name) \
+        do { \
+            *(void **)(&platform.mi.field) = dlsym(handle, name); \
+            if (platform.mi.field == NULL) goto error; \
+        } while (0)
+
+    MMF_LOAD_SYM(platform.mi.libSys, MI_SYS_Init, "MI_SYS_Init");
+    MMF_LOAD_SYM(platform.mi.libSys, MI_SYS_Exit, "MI_SYS_Exit");
+    MMF_LOAD_SYM(platform.mi.libSys, MI_SYS_MMA_Alloc, "MI_SYS_MMA_Alloc");
+    MMF_LOAD_SYM(platform.mi.libSys, MI_SYS_MMA_Free, "MI_SYS_MMA_Free");
+    MMF_LOAD_SYM(platform.mi.libSys, MI_SYS_Mmap, "MI_SYS_Mmap");
+    MMF_LOAD_SYM(platform.mi.libSys, MI_SYS_Munmap, "MI_SYS_Munmap");
+    MMF_LOAD_SYM(platform.mi.libSys, MI_SYS_FlushInvCache, "MI_SYS_FlushInvCache");
+    MMF_LOAD_SYM(platform.mi.libSys, MI_SYS_MemsetPa, "MI_SYS_MemsetPa");
+
+    MMF_LOAD_SYM(platform.mi.libGfx, MI_GFX_Open, "MI_GFX_Open");
+    MMF_LOAD_SYM(platform.mi.libGfx, MI_GFX_Close, "MI_GFX_Close");
+    MMF_LOAD_SYM(platform.mi.libGfx, MI_GFX_BitBlit, "MI_GFX_BitBlit");
+    MMF_LOAD_SYM(platform.mi.libGfx, MI_GFX_WaitAllDone, "MI_GFX_WaitAllDone");
+
+    #undef MMF_LOAD_SYM
+
+    if (platform.mi.MI_SYS_Init() != 0) goto error;
+    if (platform.mi.MI_GFX_Open() != 0) goto error;
+
+    platform.mi.srcSize = (size_t)renderWidth * (size_t)renderHeight * 4;
+    if (platform.mi.srcSize == 0) goto error;
+
+    if (platform.mi.MI_SYS_MMA_Alloc(NULL, (unsigned int)platform.mi.srcSize, &platform.mi.srcPhy) != 0) goto error;
+    if (platform.mi.MI_SYS_Mmap(platform.mi.srcPhy, (unsigned int)platform.mi.srcSize, &platform.mi.srcVir, 1) != 0) goto error;
+
+    platform.mi.fbPhy = (uint64_t)platform.finfo.smem_start;
+    (void)platform.mi.MI_SYS_Mmap(platform.mi.fbPhy, (unsigned int)platform.finfo.smem_len, &platform.mi.fbVir, 1);
+
+    if (platform.mi.MI_SYS_MemsetPa != NULL)
+    {
+        platform.mi.MI_SYS_MemsetPa(platform.mi.fbPhy, 0, (unsigned int)platform.finfo.smem_len);
+        platform.mi.MI_SYS_MemsetPa(platform.mi.srcPhy, 0, (unsigned int)platform.mi.srcSize);
+    }
+
+    platform.mi.renderWidth = renderWidth;
+    platform.mi.renderHeight = renderHeight;
+    platform.mi.enabled = true;
+    return true;
+
+error:
+    MMF_ShutdownMiGfx();
+    return false;
+}
+
+static void MMF_ShutdownMiGfx(void)
+{
+    if (platform.mi.srcVir && platform.mi.MI_SYS_Munmap) platform.mi.MI_SYS_Munmap(platform.mi.srcVir, (unsigned int)platform.mi.srcSize);
+    if (platform.mi.srcPhy && platform.mi.MI_SYS_MMA_Free) platform.mi.MI_SYS_MMA_Free(platform.mi.srcPhy);
+    if (platform.mi.fbVir && platform.mi.MI_SYS_Munmap) platform.mi.MI_SYS_Munmap(platform.mi.fbVir, (unsigned int)platform.finfo.smem_len);
+
+    if (platform.mi.MI_GFX_Close) platform.mi.MI_GFX_Close();
+    if (platform.mi.MI_SYS_Exit) platform.mi.MI_SYS_Exit();
+
+    if (platform.mi.libGfx) dlclose(platform.mi.libGfx);
+    if (platform.mi.libSys) dlclose(platform.mi.libSys);
+
+    memset(&platform.mi, 0, sizeof(platform.mi));
+}
+#endif
+
 #if !defined(_WIN32)
 // Check if a key has been pressed
 static int kbhit(void)
